@@ -1,0 +1,56 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /* ================= USERS ================= */
+    match /users/{userId} {
+      allow read, write: if request.auth != null
+                         && request.auth.uid == userId;
+    }
+
+    /* ================= PROFILE ================= */
+    match /profile/{userId} {
+      allow read, write: if request.auth != null
+                         && request.auth.uid == userId;
+    }
+
+    /* ================= INVESTMENT PLANS ================= */
+    match /investmentPlans/{planId} {
+      // Users can only read plans
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    /* ================= INVESTMENTS ================= */
+    match /investments/{investmentId} {
+
+      // User can CREATE only pending investments for themselves
+      allow create: if request.auth != null
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == "pending";
+
+      // User can READ only their own investments
+      allow read: if request.auth != null
+        && resource.data.userId == request.auth.uid;
+
+      // Users cannot update or delete investments
+      allow update, delete: if false;
+    }
+
+    /* ================= ALERTS ================= */
+    match /alerts/{alertId} {
+      allow read: if request.auth != null
+        && resource.data.userId == request.auth.uid;
+
+      allow create: if request.auth != null
+        && request.resource.data.userId == request.auth.uid;
+
+      allow update, delete: if false;
+    }
+
+    /* ================= DEFAULT DENY ================= */
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
