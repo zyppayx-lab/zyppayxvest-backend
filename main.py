@@ -1,17 +1,43 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
-from jose import jwt
-from datetime import datetime, timedelta
-import hashlib
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import sessionmaker, declarative_base
+from fastapi.middleware.cors import CORSMiddleware
+import os
 
 app = FastAPI()
 
-SECRET_KEY = "supersecretkey"
-ALGORITHM = "HS256"
+# ✅ CORS (fixes "Failed to fetch")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-users = {}
+# DATABASE
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-class UserSignup(BaseModel):
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+# MODEL
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True)
+    password = Column(String)
+    full_name = Column(String)
+    balance = Column(Integer, default=0)
+
+# CREATE TABLE
+Base.metadata.create_all(bind=engine)
+
+# REQUEST MODELS
+class UserCreate(BaseModel):
     email: str
     password: str
     full_name: str
@@ -20,53 +46,44 @@ class UserLogin(BaseModel):
     email: str
     password: str
 
-
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def verify_password(password, hashed):
-    return hash_password(password) == hashed
-
-def create_token(data: dict):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(hours=24)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-
+# ROUTES
 @app.get("/")
 def home():
     return {"message": "Zyppayx API running 🚀"}
 
-
 @app.post("/signup")
-def signup(user: UserSignup):
-    if user.email in users:
-        raise HTTPException(status_code=400, detail="User already exists")
+def signup(user: UserCreate):
+    db = SessionLocal()
 
-    users[user.email] = {
-        "full_name": user.full_name,
-        "password": hash_password(user.password),
-        "balance": 0
-    }
+    existing = db.query(User).filter(User.email == user.email).first()
+    if existing:
+        return {"detail": "User already exists"}
 
-    return {"message": "Account created successfully"}
+    new_user = User(
+        email=user.email,
+        password=user.password,
+        full_name=user.full_name
+    )
 
+    db.add(new_user)
+    db.commit()
+
+    return {"message": "User created"}
 
 @app.post("/login")
 def login(user: UserLogin):
-    db_user = users.get(user.email)
+    db = SessionLocal()
 
-    if not db_user or not verify_password(user.password, db_user["password"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    existing = db.query(User).filter(User.email == user.email).first()
 
-    token = create_token({"sub": user.email})
+    if not existing or existing.password != user.password:
+        return {"detail": "Invalid credentials"}
 
     return {
-        "access_token": token,
+        "access_token": "demo-token",
         "user": {
-            "email": user.email,
-            "full_name": db_user["full_name"],
-            "balance": db_user["balance"]
+            "email": existing.email,
+            "full_name": existing.full_name,
+            "balance": existing.balance
         }
     }
