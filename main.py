@@ -324,6 +324,39 @@ def history(email: str):
 
     return txs
 
+# ================= 📊 TRANSACTIONS =================
+
+@app.get("/transactions/{email}")
+def history(email: str):
+    db = SessionLocal()
+
+    txs = db.query(Transaction).filter(Transaction.email == email).all()
+
+    return txs
+
+
+@app.post("/add-balance")
+def add_balance(email: str, amount: int):
+    db = SessionLocal()
+
+    user = db.query(User).filter(User.email == email).first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.balance += amount
+
+    tx = Transaction(
+        email=email,
+        amount=amount,
+        type="admin_topup"
+    )
+
+    db.add(tx)
+    db.commit()
+
+    return {"message": "Balance added"}
+
 # ================= 🔐 VERIFY PAYMENT =================
 
 @app.get("/verify-payment/{reference}")
