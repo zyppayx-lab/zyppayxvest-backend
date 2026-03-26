@@ -32,6 +32,7 @@ class User(Base):
     password = Column(String)
     full_name = Column(String)
     balance = Column(Integer, default=0)
+    pin = Column(String, default="")  # ✅ NEW PIN FIELD
 
 # CREATE TABLE
 Base.metadata.create_all(bind=engine)
@@ -45,6 +46,10 @@ class UserCreate(BaseModel):
 class UserLogin(BaseModel):
     email: str
     password: str
+
+class PinData(BaseModel):
+    email: str
+    pin: str
 
 # ROUTES
 @app.get("/")
@@ -87,3 +92,18 @@ def login(user: UserLogin):
             "balance": existing.balance
         }
     }
+
+# ✅ SET PIN
+@app.post("/set-pin")
+def set_pin(data: PinData):
+    db = SessionLocal()
+
+    user = db.query(User).filter(User.email == data.email).first()
+
+    if not user:
+        return {"detail": "User not found"}
+
+    user.pin = data.pin
+    db.commit()
+
+    return {"message": "PIN set successfully"}
