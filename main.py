@@ -312,3 +312,59 @@ def history(email: str):
     txs = db.query(Transaction).filter(Transaction.email == email).all()
 
     return txs
+
+# ================= 🔐 VERIFY PAYMENT =================
+
+@app.get("/verify-payment/{reference}")
+def verify_payment(reference: str):
+    url = f"https://api.paystack.co/transaction/verify/{reference}"
+
+    headers = {
+        "Authorization": f"Bearer {PAYSTACK_SECRET}"
+    }
+
+    res = requests.get(url, headers=headers)
+    data = res.json()
+
+    if not data.get("status"):
+        raise HTTPException(status_code=400, detail="Verification failed")
+
+    return data
+
+
+# ================= 🔔 IMPROVED WEBHOOK =================
+
+@app.post("/paystack-webhook")
+async def paystack_webhook(request: Request):
+    body = await request.json()
+
+    if body.get("event") == "charge.success":
+        email = body["data"]["customer"]["email"]
+        amount = body["data"]["amount"] // 100
+
+        db = SessionLocal()
+
+        existing = db.query(Transaction).filter(
+            Transaction.email == email,
+            Transaction.amount == amount,
+            Transaction.type == "deposit"
+        ).first()
+
+        if existing:
+            return {"status": "already processed"}
+
+        user = db.query(User).filter(User.email == email).first()
+
+        if user:
+            user.balance += amount
+
+            tx = Transaction(
+                email=email,
+                amount=amount,
+                type="deposit"
+            )
+
+            db.add(tx)
+            db.commit()
+
+    return {"status": "ok"}
