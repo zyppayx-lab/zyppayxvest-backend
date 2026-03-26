@@ -226,12 +226,23 @@ def withdraw(data: WithdrawData):
 
     user = db.query(User).filter(User.email == data.email).first()
 
+    # ✅ Check user exists
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # ✅ Check PIN is set
+    if not user.pin or user.pin == "":
+        raise HTTPException(status_code=400, detail="Set PIN first")
+
+    # ✅ Check PIN is correct
     if user.pin != data.pin:
         raise HTTPException(status_code=400, detail="Wrong PIN")
 
+    # ✅ Check balance
     if user.balance < data.amount:
         raise HTTPException(status_code=400, detail="Insufficient balance")
 
+    # ✅ Process withdrawal
     user.balance -= data.amount
 
     tx = Transaction(
