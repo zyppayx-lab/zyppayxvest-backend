@@ -41,7 +41,7 @@ class Transaction(Base):
     id = Column(Integer, primary_key=True)
     email = Column(String)
     amount = Column(Integer)
-    type = Column(String)
+    type = Column(String)  # deposit, withdraw_pending, withdraw_completed, investment_profit
 
 class Investment(Base):
     __tablename__ = "investments"
@@ -51,14 +51,6 @@ class Investment(Base):
     profit = Column(Integer)
     status = Column(String, default="active")
     created_at = Column(DateTime, default=datetime.utcnow)
-
-class Bank(Base):
-    __tablename__ = "banks"
-    id = Column(Integer, primary_key=True)
-    email = Column(String)
-    account_number = Column(String)
-    bank_code = Column(String)
-    recipient_code = Column(String)
 
 Base.metadata.create_all(bind=engine)
 
@@ -89,11 +81,6 @@ class WithdrawData(BaseModel):
 class InvestData(BaseModel):
     email: str
     amount: int
-
-class BankData(BaseModel):
-    email: str
-    account_number: str
-    bank_code: str
 
 # ================= PAYSTACK =================
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY")
@@ -237,61 +224,16 @@ async def paystack_webhook(request: Request):
 
     return {"status": "ok"}
 
-# ================= BANK =================
-
-@app.post("/add-bank")
-def add_bank(data: BankData):
-    url = "https://api.paystack.co/transferrecipient"
-
-    headers = {
-        "Authorization": f"Bearer {PAYSTACK_SECRET}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "type": "nuban",
-        "name": data.email,
-        "account_number": data.account_number,
-        "bank_code": data.bank_code,
-        "currency": "NGN"
-    }
-
-    res = requests.post(url, json=payload, headers=headers)
-    response = res.json()
-
-    if not response.get("status"):
-        raise HTTPException(status_code=400, detail="Bank verification failed")
-
-    recipient_code = response["data"]["recipient_code"]
-
-    db = SessionLocal()
-
-    bank = Bank(
-        email=data.email,
-        account_number=data.account_number,
-        bank_code=data.bank_code,
-        recipient_code=recipient_code
-    )
-
-    db.add(bank)
-    db.commit()
-
-    return {"message": "Bank added successfully"}
-
-# ================= WITHDRAW =================
+# ================= WITHDRAW (MANUAL) =================
 
 @app.post("/withdraw")
 def withdraw(data: WithdrawData):
     db = SessionLocal()
 
     user = db.query(User).filter(User.email == data.email).first()
-    bank = db.query(Bank).filter(Bank.email == data.email).first()
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-
-    if not bank:
-        raise HTTPException(status_code=400, detail="Add bank first")
 
     if user.pin != data.pin:
         raise HTTPException(status_code=400, detail="Wrong PIN")
@@ -299,38 +241,44 @@ def withdraw(data: WithdrawData):
     if user.balance < data.amount:
         raise HTTPException(status_code=400, detail="Insufficient balance")
 
-    url = "https://api.paystack.co/transfer"
-
-    headers = {
-        "Authorization": f"Bearer {PAYSTACK_SECRET}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "source": "balance",
-        "amount": data.amount * 100,
-        "recipient": bank.recipient_code,
-        "reason": "Withdrawal"
-    }
-
-    res = requests.post(url, json=payload, headers=headers)
-    response = res.json()
-
-    if not response.get("status"):
-        raise HTTPException(status_code=400, detail="Transfer failed")
-
-    user.balance -= data.amount
-
+    # 🔴 Do NOT deduct yet
     tx = Transaction(
         email=data.email,
         amount=data.amount,
-        type="withdraw"
+        type="withdraw_pending"
     )
 
     db.add(tx)
     db.commit()
 
-    return {"message": "Withdrawal successful"}
+    return {"message": "Withdrawal request submitted"}
+
+# ================= ADMIN APPROVE =================
+
+@app.post("/approve-withdraw")
+def approve_withdraw(email: str, amount: int):
+    db = SessionLocal()
+
+    user = db.query(User).filter(User.email == email).first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if user.balance < amount:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
+
+    user.balance -= amount
+
+    tx = Transaction(
+        email=email,
+        amount=amount,
+        type="withdraw_completed"
+    )
+
+    db.add(tx)
+    db.commit()
+
+    return {"message": "Withdrawal approved"}
 
 # ================= INVEST =================
 
@@ -360,6 +308,35 @@ def invest(data: InvestData):
     db.commit()
 
     return {"message": "Investment started"}
+
+# ================= COMPLETE INVEST =================
+
+@app.post("/complete-investments/{email}")
+def complete_investments(email: str):
+    db = SessionLocal()
+
+    investments = db.query(Investment).filter(
+        Investment.email == email,
+        Investment.status == "active"
+    ).all()
+
+    user = db.query(User).filter(User.email == email).first()
+
+    for inv in investments:
+        total = inv.amount + inv.profit
+        user.balance += total
+        inv.status = "completed"
+
+        tx = Transaction(
+            email=email,
+            amount=total,
+            type="investment_profit"
+        )
+        db.add(tx)
+
+    db.commit()
+
+    return {"message": "Investments completed"}
 
 # ================= TRANSACTIONS =================
 
