@@ -1,349 +1,318 @@
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, DateTime
-from sqlalchemy.orm import sessionmaker, declarative_base
+# ================= IMPORTS =================
+from fastapi import FastAPI, HTTPException, Depends, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import sessionmaker, declarative_base
+from jose import jwt
+from cryptography.fernet import Fernet
+from datetime import datetime, timedelta
+from pydantic import BaseModel
 import requests
 import os
+import uuid
+import hashlib
+import redis
+import bcrypt
+import logging
+import hmac
+import time
 
+# ================= INIT =================
 app = FastAPI()
+logging.basicConfig(level=logging.INFO)
 
-# ================= CORS =================
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ================= DATABASE =================
+# ================= ENV =================
 DATABASE_URL = os.getenv("DATABASE_URL")
+JWT_SECRET = os.getenv("JWT_SECRET")
+FERNET_KEY = os.getenv("FERNET_KEY")
+PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY")
+REDIS_URL = os.getenv("REDIS_URL")
+MAILERSEND_API_KEY = os.getenv("MAILERSEND_API_KEY")
+SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 
+# ================= SETUP =================
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
+
+r = redis.from_url(REDIS_URL, decode_responses=True)
+cipher = Fernet(FERNET_KEY)
+
+security = HTTPBearer()
+ALGO = "HS256"
+
+# ================= HELPERS =================
+
+def hash_password(p): return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
+def verify_password(p, h): return bcrypt.checkpw(p.encode(), h.encode())
+def hash_pin(p): return hashlib.sha256(p.encode()).hexdigest()
+
+def encrypt(t): return cipher.encrypt(t.encode()).decode()
+def decrypt(t): return cipher.decrypt(t.encode()).decode()
+
+def create_access(email):
+    return jwt.encode({"sub": email, "exp": datetime.utcnow() + timedelta(minutes=30)}, JWT_SECRET, algorithm=ALGO)
+
+def create_refresh(email):
+    return jwt.encode({"sub": email, "type": "refresh", "exp": datetime.utcnow() + timedelta(days=7)}, JWT_SECRET, algorithm=ALGO)
+
+def get_user(token: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(token.credentials, JWT_SECRET, algorithms=[ALGO])
+        email = payload.get("sub")
+    except:
+        raise HTTPException(401, "Invalid token")
+
+    db = SessionLocal()
+    user = db.query(User).filter_by(email=email).first()
+    if not user:
+        raise HTTPException(404, "User not found")
+    return user
+
+def admin_only(user=Depends(get_user)):
+    if user.role != "admin":
+        raise HTTPException(403, "Admin only")
+    return user
+
+# ================= REDIS OTP =================
+
+def save_otp(email, otp):
+    r.set(f"otp:{email}", otp, ex=300)
+
+def verify_otp(email, otp):
+    stored = r.get(f"otp:{email}")
+    if not stored or stored != otp:
+        return False
+    r.delete(f"otp:{email}")
+    return True
+
+# ================= EMAIL =================
+
+def send_email(to, subject, message):
+    requests.post(
+        "https://api.mailersend.com/v1/email",
+        headers={"Authorization": f"Bearer {MAILERSEND_API_KEY}"},
+        json={
+            "from": {"email": SENDER_EMAIL},
+            "to": [{"email": to}],
+            "subject": subject,
+            "text": message
+        }
+    )
+
+def notify(user, subject, msg):
+    send_email(user.email, subject, msg)
 
 # ================= MODELS =================
 
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
-    email = Column(String, unique=True)
+    email = Column(String, unique=True, index=True)
     password = Column(String)
-    full_name = Column(String)
+    pin = Column(String)
+    role = Column(String, default="user")
+    refresh_token = Column(String)
+
+    account_number = Column(String)
+    bank_code = Column(String)
+    recipient_code = Column(String)
+
+class Wallet(Base):
+    __tablename__ = "wallets"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, index=True)
+    currency = Column(String)
     balance = Column(Integer, default=0)
-    pin = Column(String, default="")
+    pending_balance = Column(Integer, default=0)
 
 class Transaction(Base):
     __tablename__ = "transactions"
     id = Column(Integer, primary_key=True)
-    email = Column(String)
+    user_id = Column(Integer, index=True)
     amount = Column(Integer)
-    type = Column(String)  # deposit, withdraw_pending, withdraw_completed, investment_profit
+    currency = Column(String)
+    type = Column(String)
+    status = Column(String)
+    reference = Column(String, unique=True, index=True)
 
-class Investment(Base):
-    __tablename__ = "investments"
+class Ledger(Base):
+    __tablename__ = "ledger"
     id = Column(Integer, primary_key=True)
-    email = Column(String)
+    user_id = Column(Integer)
+    currency = Column(String)
     amount = Column(Integer)
-    profit = Column(Integer)
-    status = Column(String, default="active")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    before_balance = Column(Integer)
+    after_balance = Column(Integer)
+    reference = Column(String)
 
 Base.metadata.create_all(bind=engine)
 
-# ================= REQUEST MODELS =================
+# ================= REQUESTS =================
 
-class UserCreate(BaseModel):
-    email: str
-    password: str
-    full_name: str
-
-class UserLogin(BaseModel):
+class Signup(BaseModel):
     email: str
     password: str
 
-class PinData(BaseModel):
+class Login(BaseModel):
     email: str
+    password: str
+
+class OTP(BaseModel):
+    email: str
+    otp: str
+
+class Withdraw(BaseModel):
+    amount: int
+    currency: str
     pin: str
 
-class DepositData(BaseModel):
-    email: str
-    amount: int
-
-class WithdrawData(BaseModel):
-    email: str
-    amount: int
-    pin: str
-
-class InvestData(BaseModel):
-    email: str
-    amount: int
-
-# ================= PAYSTACK =================
-PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY")
-
-# ================= ROUTES =================
-
-@app.get("/")
-def home():
-    return {"message": "Zyppayx API running 🚀"}
+class Bank(BaseModel):
+    account_number: str
+    bank_code: str
 
 # ================= AUTH =================
 
 @app.post("/signup")
-def signup(user: UserCreate):
+def signup(data: Signup):
     db = SessionLocal()
 
-    existing = db.query(User).filter(User.email == user.email).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="User exists")
+    if db.query(User).filter_by(email=data.email).first():
+        raise HTTPException(400, "User exists")
 
-    new_user = User(
-        email=user.email,
-        password=user.password,
-        full_name=user.full_name
-    )
-
-    db.add(new_user)
+    user = User(email=data.email, password=hash_password(data.password))
+    db.add(user)
     db.commit()
 
-    return {"message": "User created"}
+    for c in ["NGN","USD","GHS","KES"]:
+        db.add(Wallet(user_id=user.id, currency=c))
+
+    db.commit()
+    return {"msg": "Account created"}
 
 @app.post("/login")
-def login(user: UserLogin):
+def login(data: Login):
     db = SessionLocal()
+    user = db.query(User).filter_by(email=data.email).first()
 
-    user_db = db.query(User).filter(User.email == user.email).first()
+    if not user or not verify_password(data.password, user.password):
+        raise HTTPException(401, "Invalid credentials")
 
-    if not user_db or user_db.password != user.password:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    otp = str(uuid.uuid4())[:6]
+    save_otp(data.email, otp)
+    send_email(data.email, "Login OTP", otp)
 
-    return {
-        "access_token": "token",
-        "user": {
-            "email": user_db.email,
-            "full_name": user_db.full_name,
-            "balance": user_db.balance
-        }
-    }
+    return {"msg": "OTP sent"}
 
-# ================= PIN =================
+@app.post("/verify-login")
+def verify_login(data: OTP):
+    if not verify_otp(data.email, data.otp):
+        raise HTTPException(400, "Invalid OTP")
 
-@app.post("/set-pin")
-def set_pin(data: PinData):
     db = SessionLocal()
+    user = db.query(User).filter_by(email=data.email).first()
 
-    user = db.query(User).filter(User.email == data.email).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    access = create_access(user.email)
+    refresh = create_refresh(user.email)
 
-    user.pin = data.pin
+    user.refresh_token = refresh
     db.commit()
 
-    return {"message": "PIN set successfully"}
+    return {"access": access, "refresh": refresh}
 
-# ================= USER =================
+# ================= WITHDRAW =================
 
-@app.get("/user/{email}")
-def get_user(email: str):
+@app.post("/withdraw")
+def withdraw(data: Withdraw, user: User = Depends(get_user)):
     db = SessionLocal()
 
-    user = db.query(User).filter(User.email == email).first()
+    wallet = db.query(Wallet)\
+        .filter_by(user_id=user.id, currency=data.currency)\
+        .with_for_update()\
+        .first()
 
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    if wallet.balance < data.amount:
+        raise HTTPException(400, "Insufficient")
 
-    return {
-        "email": user.email,
-        "full_name": user.full_name,
-        "balance": user.balance
-    }
+    if user.pin != hash_pin(data.pin):
+        raise HTTPException(400, "Wrong PIN")
 
-# ================= DEPOSIT =================
+    ref = str(uuid.uuid4())
 
-@app.post("/create-payment")
-def create_payment(data: DepositData):
-    url = "https://api.paystack.co/transaction/initialize"
+    wallet.pending_balance += data.amount
 
-    headers = {
-        "Authorization": f"Bearer {PAYSTACK_SECRET}",
-        "Content-Type": "application/json"
-    }
+    db.add(Transaction(
+        user_id=user.id,
+        amount=data.amount,
+        currency=data.currency,
+        type="withdraw",
+        status="pending",
+        reference=ref
+    ))
 
-    payload = {
-        "email": data.email,
-        "amount": data.amount * 100,
-        "callback_url": "https://zyppayx.name.ng/payment-success.html"
-    }
+    db.commit()
 
-    res = requests.post(url, json=payload, headers=headers)
-    response = res.json()
+    notify(user, "Withdrawal Requested", f"{data.amount} pending")
 
-    if not response.get("status"):
-        raise HTTPException(status_code=400, detail="Payment init failed")
-
-    return {"payment_url": response["data"]["authorization_url"]}
+    return {"msg": "Pending approval"}
 
 # ================= WEBHOOK =================
 
-@app.post("/paystack-webhook")
-async def paystack_webhook(request: Request):
-    body = await request.json()
+@app.post("/webhook/paystack")
+async def webhook(req: Request):
+    body = await req.body()
 
-    if body.get("event") == "charge.success":
-        email = body["data"]["customer"]["email"]
-        amount = body["data"]["amount"] // 100
+    signature = req.headers.get("x-paystack-signature")
+    computed = hmac.new(PAYSTACK_SECRET.encode(), body, hashlib.sha512).hexdigest()
 
-        db = SessionLocal()
+    if signature != computed:
+        raise HTTPException(400, "Invalid signature")
 
-        existing = db.query(Transaction).filter(
-            Transaction.email == email,
-            Transaction.amount == amount,
-            Transaction.type == "deposit"
-        ).first()
+    payload = await req.json()
+    event = payload.get("event")
 
-        if existing:
-            return {"status": "already processed"}
+    db = SessionLocal()
 
-        user = db.query(User).filter(User.email == email).first()
+    if event == "transfer.success":
+        ref = payload["data"]["reference"]
+        tx = db.query(Transaction).filter_by(reference=ref).first()
 
-        if user:
-            user.balance += amount
+        if tx and tx.status != "approved":
+            wallet = db.query(Wallet)\
+                .filter_by(user_id=tx.user_id, currency=tx.currency)\
+                .with_for_update()\
+                .first()
 
-            tx = Transaction(
-                email=email,
-                amount=amount,
-                type="deposit"
-            )
+            wallet.pending_balance -= tx.amount
+            wallet.balance -= tx.amount
 
-            db.add(tx)
+            tx.status = "approved"
             db.commit()
 
     return {"status": "ok"}
 
-# ================= WITHDRAW (MANUAL) =================
+# ================= ADMIN =================
 
-@app.post("/withdraw")
-def withdraw(data: WithdrawData):
+@app.post("/admin/approve")
+def approve(tx_id: int, admin=Depends(admin_only)):
+    from celery_worker import process_transfer
+
     db = SessionLocal()
+    tx = db.query(Transaction).filter_by(id=tx_id).first()
 
-    user = db.query(User).filter(User.email == data.email).first()
+    if tx.status != "pending":
+        raise HTTPException(400, "Already processed")
 
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = db.query(User).filter_by(id=tx.user_id).first()
 
-    if user.pin != data.pin:
-        raise HTTPException(status_code=400, detail="Wrong PIN")
+    transfer_ref = str(uuid.uuid4())
 
-    if user.balance < data.amount:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
+    process_transfer.delay(user.recipient_code, tx.amount, transfer_ref)
 
-    # 🔴 Do NOT deduct yet
-    tx = Transaction(
-        email=data.email,
-        amount=data.amount,
-        type="withdraw_pending"
-    )
-
-    db.add(tx)
-    db.commit()
-
-    return {"message": "Withdrawal request submitted"}
-
-# ================= ADMIN APPROVE =================
-
-@app.post("/approve-withdraw")
-def approve_withdraw(email: str, amount: int):
-    db = SessionLocal()
-
-    user = db.query(User).filter(User.email == email).first()
-
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    if user.balance < amount:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
-
-    user.balance -= amount
-
-    tx = Transaction(
-        email=email,
-        amount=amount,
-        type="withdraw_completed"
-    )
-
-    db.add(tx)
-    db.commit()
-
-    return {"message": "Withdrawal approved"}
-
-# ================= INVEST =================
-
-@app.post("/invest")
-def invest(data: InvestData):
-    db = SessionLocal()
-
-    user = db.query(User).filter(User.email == data.email).first()
-
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    if user.balance < data.amount:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
-
-    user.balance -= data.amount
-
-    profit = int(data.amount * 0.3)
-
-    inv = Investment(
-        email=data.email,
-        amount=data.amount,
-        profit=profit
-    )
-
-    db.add(inv)
-    db.commit()
-
-    return {"message": "Investment started"}
-
-# ================= COMPLETE INVEST =================
-
-@app.post("/complete-investments/{email}")
-def complete_investments(email: str):
-    db = SessionLocal()
-
-    investments = db.query(Investment).filter(
-        Investment.email == email,
-        Investment.status == "active"
-    ).all()
-
-    user = db.query(User).filter(User.email == email).first()
-
-    for inv in investments:
-        total = inv.amount + inv.profit
-        user.balance += total
-        inv.status = "completed"
-
-        tx = Transaction(
-            email=email,
-            amount=total,
-            type="investment_profit"
-        )
-        db.add(tx)
+    tx.status = "processing"
+    tx.reference = transfer_ref
 
     db.commit()
 
-    return {"message": "Investments completed"}
-
-# ================= TRANSACTIONS =================
-
-@app.get("/transactions/{email}")
-def history(email: str):
-    db = SessionLocal()
-
-    txs = db.query(Transaction).filter(Transaction.email == email).all()
-
-    return txs
+    return {"msg": "Transfer queued"}
