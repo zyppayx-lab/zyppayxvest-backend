@@ -1,12 +1,7 @@
-fastapi>=0.110.0
+fastapi
 uvicorn
 sqlalchemy
-psycopg2-binary
-python-jose
-cryptography
-redis
 bcrypt
+python-jose
 requests
-celery
-python-dotenv
-pydantic>=2.6.0
+psycopg[binary]
